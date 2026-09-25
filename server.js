@@ -11,6 +11,7 @@ const app = express();
 app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET;
+const CACHE_TTL_MS = 30 * 1000; // 30 seconds
 
 // --- Database setup ---
 const db = new sqlite3.Database('./tracker.db');
@@ -104,18 +105,17 @@ app.post('/login', (req, res) => {
 });
 
 // --- Fake store (simulates a real product page with a fluctuating price) ---
-const fakeStorePrices = {}; // in-memory: { productKey: currentPrice }
+const fakeStorePrices = {};
 
 app.get('/fake-store/:id', (req, res) => {
   const id = req.params.id;
 
   if (!(id in fakeStorePrices)) {
-    fakeStorePrices[id] = Math.floor(Math.random() * 50) + 50; // start between 50-99
+    fakeStorePrices[id] = Math.floor(Math.random() * 50) + 50;
   }
 
-  // 30% chance the price shifts a bit on each visit, to simulate real changes
   if (Math.random() < 0.3) {
-    const change = Math.floor(Math.random() * 10) - 5; // -5 to +4
+    const change = Math.floor(Math.random() * 10) - 5;
     fakeStorePrices[id] = Math.max(10, fakeStorePrices[id] + change);
   }
 
@@ -130,12 +130,17 @@ app.get('/fake-store/:id', (req, res) => {
 });
 
 // --- Scraper ---
+async function scrapePrice(url) {
+  const response = await axios.get(url);
+  const $ = cheerio.load(response.data);
+  const priceText = $('.price').first().text().replace('$', '').trim();
+  const price = parseFloat(priceText);
+  return price;
+}
+
 async function checkProductPrice(product) {
   try {
-    const response = await axios.get(product.url);
-    const $ = cheerio.load(response.data);
-    const priceText = $('.price').first().text().replace('$', '').trim();
-    const price = parseFloat(priceText);
+    const price = await scrapePrice(product.url);
 
     if (isNaN(price)) {
       console.log(`[${new Date().toISOString()}] Product ${product.id}: could not parse price`);
@@ -164,6 +169,9 @@ cron.schedule('* * * * *', () => {
     products.forEach(checkProductPrice);
   });
 });
+
+// --- Price cache ---
+const priceCache = {}; // { productId: { price, cachedAt } }
 
 // --- Product routes (protected) ---
 app.post('/products', requireAuth, (req, res) => {
@@ -195,6 +203,40 @@ app.get('/products/:id/history', requireAuth, (req, res) => {
     (err, rows) => {
       if (err) return res.status(500).json({ error: 'database error' });
       res.json(rows);
+    }
+  );
+});
+
+app.get('/products/:id/price', requireAuth, (req, res) => {
+  const productId = req.params.id;
+
+  db.get(
+    'SELECT * FROM products WHERE id = ? AND user_id = ?',
+    [productId, req.userId],
+    async (err, product) => {
+      if (err) return res.status(500).json({ error: 'database error' });
+      if (!product) return res.status(404).json({ error: 'product not found' });
+
+      const cached = priceCache[productId];
+      const now = Date.now();
+
+      if (cached && now - cached.cachedAt < CACHE_TTL_MS) {
+        console.log(`[${new Date().toISOString()}] Product ${productId}: cache HIT`);
+        return res.json({
+          price: cached.price,
+          source: 'cache',
+          cachedAgeMs: now - cached.cachedAt
+        });
+      }
+
+      try {
+        console.log(`[${new Date().toISOString()}] Product ${productId}: cache MISS - scraping`);
+        const price = await scrapePrice(product.url);
+        priceCache[productId] = { price, cachedAt: now };
+        res.json({ price, source: 'live' });
+      } catch (err) {
+        res.status(500).json({ error: 'failed to fetch price' });
+      }
     }
   );
 });
